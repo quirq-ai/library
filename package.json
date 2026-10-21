@@ -1,0 +1,12 @@
+{
+  "name": "library",
+  "private": true,
+  "description": "One repo, one branch per GitHub project.",
+  "license": "Apache-2.0",
+  "scripts": {
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

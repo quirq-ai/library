@@ -1,0 +1,740 @@
+#!/usr/bin/env node
+// Keep GitHub projects in one repo, one branch each (branch name = owner/repo),
+// then rebuild the index in README.md on main. Copies come straight from GitHub:
+// one shallow fetch of the upstream commit, and its tree committed unchanged, so a
+// copy's tree id is the upstream tree id.
+//
+//   ./library add owner/repo [--ref <branch|tag|sha>] [--mode copy|lean|pointer]
+//   ./library update [owner/repo ...]   take each project's new upstream commit, if any
+//   ./library check [--upstream]        verify every branch against the index (and upstream)
+//   ./library get owner/repo [dir]      clone just that project
+//   ./library retire owner/repo         squash it onto the attic branch and delete its branch
+//   ./library index                     rewrite the README index from library.json
+//
+// Every command that writes takes --dry-run: it may fetch to look, and writes and pushes nothing.
+'use strict'
+
+const { spawnSync } = require('node:child_process')
+const fs = require('node:fs')
+const os = require('node:os')
+const path = require('node:path')
+
+const ROOT = __dirname
+const GIT_DIR = path.join(ROOT, '.git')
+const MANIFEST = path.join(ROOT, 'library.json')
+const README = path.join(ROOT, 'README.md')
+const SCRATCH_INDEX = path.join(GIT_DIR, 'library.index')
+const LOCK = path.join(GIT_DIR, 'library.lock')
+const MB = 1 << 20
+const GITHUB_MAX = 100 * MB // GitHub rejects files over 100 MB
+const TOOL = 'Library-Tool: library/1'
+const ATTIC = 'attic'
+const RESERVED = new Set(['main', ATTIC]) // branches that are not projects
+const SLUG = /^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?\/[A-Za-z0-9._-]+$/
+const SHA = /^[0-9a-f]{40}$/
+const START = '<!-- index:start -->'
+const END = '<!-- index:end -->'
+// Where projects come from. Tests point it at local bare repos.
+const UPSTREAM = (process.env.LIBRARY_UPSTREAM || 'https://github.com').replace(/\/+$/, '')
+
+// Never let git pick up a repo from the caller's environment.
+const ENV = { ...process.env }
+for (const key of ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE']) delete ENV[key]
+
+function run(args, { cwd = ROOT, env = ENV, input } = {}) {
+  return spawnSync('git', args, { cwd, env, input, maxBuffer: 1 << 30 })
+}
+
+// Upstream is read the way a stranger reads it: no stored login, netrc, ssh key, token header or
+// prompt reaches it. So only public repos can be copied into this public one, owners' repos included.
+const ANON_ENV = { ...ENV, HOME: path.join(GIT_DIR, 'library-anon'), GIT_CONFIG_GLOBAL: os.devNull, GIT_TERMINAL_PROMPT: '0', GIT_SSH_COMMAND: 'false' }
+for (const key of ['GIT_ASKPASS', 'SSH_ASKPASS', 'XDG_CONFIG_HOME']) delete ANON_ENV[key]
+const ANON = ['-c', 'credential.helper=', '-c', 'core.askPass=', '-c', 'http.extraHeader=', '-c', `http.${UPSTREAM}/.extraHeader=`]
+const anon = (args) => run([...ANON, ...args], { env: ANON_ENV })
+
+function git(args, { ok = false, ...options } = {}) {
+  const r = run(args, options)
+  if (r.status === 0) return r.stdout.toString()
+  if (ok) return null
+  throw new Error(`git ${args.join(' ')}\n${r.stderr}`)
+}
+
+const lastLine = (buffer) => buffer.toString().trim().split('\n').pop()
+
+function die(message) {
+  console.error(message)
+  process.exit(1)
+}
+
+const alive = (pid) => {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return error.code === 'EPERM'
+  }
+}
+
+// Runs share the scratch index and the manifest, so a checkout runs one at a time.
+// A lock left behind by a run that died is taken over.
+function lock() {
+  let holder = 0
+  try {
+    holder = Number(fs.readFileSync(LOCK, 'utf8'))
+  } catch {}
+  if (holder && alive(holder)) die(`Another ./library (pid ${holder}) is running in this checkout. Wait for it to finish.`)
+  if (holder) fs.rmSync(LOCK, { force: true })
+  try {
+    fs.writeFileSync(LOCK, `${process.pid}\n`, { flag: 'wx' })
+  } catch {
+    die('Another ./library just started in this checkout. Wait for it to finish.')
+  }
+  process.on('exit', () => fs.rmSync(LOCK, { force: true }))
+}
+
+// --- arguments -------------------------------------------------------------
+
+const VALUE_FLAGS = new Set(['ref', 'mode', 'license', 'description'])
+
+function parseArgs(argv) {
+  const flags = {}
+  const args = []
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i]
+    if (!a.startsWith('--')) {
+      args.push(a)
+      continue
+    }
+    const [key, inline] = a.slice(2).split(/=(.*)/s)
+    if (!VALUE_FLAGS.has(key)) flags[key] = true
+    else if (inline !== undefined) flags[key] = inline
+    else if (i + 1 < argv.length) flags[key] = argv[++i]
+    else die(`--${key} needs a value.`)
+  }
+  return { flags, args }
+}
+
+// owner/repo, also from a pasted GitHub URL.
+function slugArg(arg) {
+  const slug = arg
+    .replace(/^(https?:\/\/)?(www\.)?github\.com\//, '')
+    .replace(/\.git$/, '')
+    .replace(/\/+$/, '')
+  if (!SLUG.test(slug)) die(`"${arg}" is not a GitHub project. Use owner/repo, for example google-research/timesfm.`)
+  if (RESERVED.has(slug.split('/')[0])) die(`"${slug}" can't be a branch here: ${slug.split('/')[0]} is a reserved branch name.`)
+  return slug
+}
+
+// --- manifest and origin ---------------------------------------------------
+
+function readJson(file) {
+  try {
+    return JSON.parse(fs.readFileSync(file, 'utf8'))
+  } catch {
+    return null
+  }
+}
+
+function loadManifest() {
+  const manifest = readJson(MANIFEST) ?? die('library.json is missing or is not valid JSON.')
+  manifest.owners ??= []
+  manifest.limits = { project_mb: 50, lean_file_mb: 10, ...manifest.limits }
+  manifest.projects ??= {}
+  manifest.retired ??= {}
+  return manifest
+}
+
+function isRepo(dir) {
+  const top = git(['rev-parse', '--show-toplevel'], { cwd: dir, ok: true })
+  return top !== null && fs.realpathSync(top.trim()) === fs.realpathSync(dir)
+}
+
+function remoteBranches() {
+  const out = git(['ls-remote', '--heads', 'origin'], { ok: true })
+  if (out === null) die('Cannot reach origin. Check the network and your GitHub login.')
+  const branches = new Map()
+  for (const line of out.split('\n').filter(Boolean)) {
+    const [sha, ref] = line.split('\t')
+    branches.set(ref.replace('refs/heads/', ''), sha)
+  }
+  return branches
+}
+
+// main has to fast-forward to origin before the index changes, or pushing it fails. A run pushes
+// HEAD to main, so it runs only on main and only when main holds nothing origin lacks: the push then
+// adds the index commit and nothing that skipped review.
+function syncMain(remote) {
+  if (git(['symbolic-ref', '-q', '--short', 'HEAD'], { ok: true })?.trim() !== 'main') {
+    die('Run ./library from main (git switch main): it pushes this checkout to main.')
+  }
+  if (!remote.has('main')) return
+  git(['fetch', '-q', 'origin', 'main'])
+  if (git(['merge', '-q', '--ff-only', 'origin/main'], { ok: true }) === null) {
+    die('Local main has diverged from origin/main. Reconcile them, then run this again.')
+  }
+  if (git(['rev-list', '--count', 'origin/main..HEAD']).trim() !== '0') {
+    die('Local main has commits that are not on origin/main. Land them through a pull request first, then run this again.')
+  }
+}
+
+// Make sure a commit we only know by id is here, without its history.
+function have(sha, from = 'origin') {
+  if (git(['cat-file', '-e', `${sha}^{commit}`], { ok: true }) !== null) return
+  git(['fetch', '-q', '--depth', '1', '--no-tags', from, sha])
+}
+
+function originUrl() {
+  return git(['config', '--get', 'remote.origin.url']).trim()
+}
+
+function repoUrl() {
+  const slug = originUrl().match(/github\.com[:/]+([^/]+\/[^/]+?)(?:\.git)?\/?$/)?.[1]
+  return slug ? `https://github.com/${slug}` : originUrl().replace(/\.git$/, '')
+}
+
+// --- upstream --------------------------------------------------------------
+
+const upstreamUrl = (slug) => `${UPSTREAM}/${slug}.git`
+const webUrl = (slug) => `https://github.com/${slug}`
+
+// The upstream commit a project follows: its default branch, or --ref (branch, tag or sha).
+function resolve(slug, ref) {
+  const url = upstreamUrl(slug)
+  if (ref && SHA.test(ref)) return { url, want: ref, sha: ref, ref }
+  const listed = ref
+    ? anon(['ls-remote', url, `refs/heads/${ref}`, `refs/tags/${ref}`, `refs/tags/${ref}^{}`])
+    : anon(['ls-remote', '--symref', url, 'HEAD'])
+  const out = listed.status === 0 ? listed.stdout.toString() : null
+  if (out === null) return { error: `cannot read ${webUrl(slug)} without logging in: it is private, renamed or gone, and only public repos are copied` }
+  const lines = out.split('\n').filter(Boolean)
+  const find = (name) => lines.find((l) => !l.startsWith('ref: ') && l.endsWith(`\t${name}`))?.split('\t')[0]
+  if (!ref) {
+    const head = find('HEAD')
+    const branch = lines.find((l) => l.startsWith('ref: '))?.match(/refs\/heads\/(\S+)/)?.[1]
+    return head ? { url, want: 'HEAD', sha: head, ref: branch ?? 'HEAD' } : { error: `${webUrl(slug)} is empty` }
+  }
+  const sha = find(`refs/tags/${ref}^{}`) ?? find(`refs/tags/${ref}`) ?? find(`refs/heads/${ref}`)
+  const want = find(`refs/heads/${ref}`) ? `refs/heads/${ref}` : `refs/tags/${ref}`
+  return sha ? { url, want, sha, ref } : { error: `${webUrl(slug)} has no branch or tag "${ref}"` }
+}
+
+// One shallow fetch of the upstream commit into this repo's own objects.
+function fetchUpstream(target) {
+  const fetched = anon(['fetch', '-q', '--depth', '1', '--no-tags', target.url, target.want])
+  if (fetched.status !== 0) return { error: `fetching ${target.url} failed: ${lastLine(fetched.stderr)}` }
+  const sha = git(['rev-parse', 'FETCH_HEAD^{commit}']).trim()
+  return {
+    sha,
+    tree: git(['rev-parse', `${sha}^{tree}`]).trim(),
+    date: git(['log', '-1', '--format=%cI', sha]).trim(),
+  }
+}
+
+// --- reading a tree --------------------------------------------------------
+
+function blobs(tree) {
+  const out = git(['ls-tree', '-r', '-l', '-z', tree])
+  return out
+    .split('\0')
+    .filter(Boolean)
+    .map((line) => {
+      const [meta, file] = line.split('\t')
+      const [mode, type, sha, size] = meta.split(/\s+/)
+      return { mode, type, sha, size: type === 'blob' ? Number(size) : 0, path: file }
+    })
+}
+
+const rootNames = (tree) => git(['ls-tree', '--name-only', '-z', tree]).split('\0').filter(Boolean)
+const readBlob = (tree, file) => git(['cat-file', 'blob', `${tree}:${file}`], { ok: true })
+
+// Known open licenses, matched on their own wording. Order matters: GPL before LGPL's text.
+const LICENSES = [
+  ['AGPL-3.0', /GNU AFFERO GENERAL PUBLIC LICENSE/],
+  ['LGPL-3.0', /GNU LESSER GENERAL PUBLIC LICENSE\s+Version 3/],
+  ['LGPL-2.1', /GNU LESSER GENERAL PUBLIC LICENSE\s+Version 2\.1/],
+  ['GPL-3.0', /GNU GENERAL PUBLIC LICENSE\s+Version 3/],
+  ['GPL-2.0', /GNU GENERAL PUBLIC LICENSE\s+Version 2/],
+  ['Apache-2.0', /Apache License[\s\S]{0,40}Version 2\.0/],
+  ['MPL-2.0', /Mozilla Public License,?\s+(v\.\s*|Version\s+)2\.0/],
+  ['MIT', /Permission is hereby granted, free of charge/],
+  ['ISC', /Permission to use, copy, modify, and\/?o?r? distribute this software for any/],
+  ['BSD-3-Clause', /Redistribution and use in source and binary forms[\s\S]*(Neither the name|names of its\s+contributors)/],
+  ['BSD-2-Clause', /Redistribution and use in source and binary forms/],
+  ['Unlicense', /This is free and unencumbered software released into the public domain/],
+  ['CC0-1.0', /CC0 1\.0 Universal/],
+  ['BSL-1.0', /Boost Software License/],
+  ['Zlib', /This software is provided 'as-is', without any express or implied/],
+]
+
+// Source-available and open-core terms often quote an open license: Sentry's FSL names Apache 2.0,
+// PostHog's MIT file carves out ee/ for a license that forbids publishing it. Any of these in any
+// license file of the project means it is not open, whatever else the file says.
+const NOT_OPEN = /Functional Source License|Business Source License|Server Side Public License|Commons Clause|Elastic License|Sustainable Use License|PolyForm|Source[- ]Available|Enterprise License|Portions of this software are licensed/i
+const LICENSE_FILE = /^(licen[cs]e|copying)([.-][\w.-]+)?$/i
+
+function detectLicense(tree) {
+  const file = rootNames(tree).find((f) => LICENSE_FILE.test(f))
+  const text = file ? readBlob(tree, file) : null
+  if (!text || NOT_OPEN.test(text)) return null
+  const nested = blobs(tree).filter((f) => f.type === 'blob' && f.path.includes('/') && LICENSE_FILE.test(path.posix.basename(f.path)))
+  if (nested.some((f) => NOT_OPEN.test(readBlob(tree, f.path) ?? ''))) return null
+  return LICENSES.find(([, re]) => re.test(text))?.[0] ?? null
+}
+
+// First sentence of the README, else package.json's description.
+function describe(tree) {
+  const readme = rootNames(tree).find((f) => /^readme(\.md|\.markdown|\.txt|\.rst)?$/i.test(f))
+  const lines = readme ? (readBlob(tree, readme) ?? '').split('\n') : []
+  // The first paragraph that reads like prose, its wrapped lines joined.
+  const start = lines.findIndex((l) => /^[A-Za-z*_]/.test(l.trim()))
+  const end = start < 0 ? -1 : lines.findIndex((l, i) => i > start && !/^[A-Za-z*_(`"']/.test(l.trim()))
+  const line = start < 0 ? null : lines.slice(start, end < 0 ? undefined : end).map((l) => l.trim()).join(' ')
+  const pkg = JSON.parse(readBlob(tree, 'package.json') ?? 'null')
+  const text = line ? line.replace(/\[([^\]]*)\]\([^)]*\)/g, '$1').replace(/<[^>]+>/g, '').replace(/[*_`]/g, '') : pkg?.description
+  if (!text) return ''
+  const sentence = text.match(/^.*?[.!?](\s|$)/)?.[0].trim() ?? text
+  return sentence.length > 160 ? `${sentence.slice(0, 157)}...` : sentence
+}
+
+function detectStack(tree) {
+  const names = rootNames(tree)
+  const has = (f) => names.includes(f)
+  let pkg = null
+  try {
+    pkg = JSON.parse(readBlob(tree, 'package.json') ?? 'null')
+  } catch {}
+  const deps = { ...pkg?.dependencies, ...pkg?.devDependencies }
+  const tags = []
+  if (pkg) tags.push(deps.next ? 'Next.js' : deps.electron ? 'Electron' : deps.vite ? 'Vite' : deps.react ? 'React' : 'Node.js')
+  if (deps.three || deps['@react-three/fiber']) tags.push('Three.js')
+  if (has('Cargo.toml')) tags.push('Rust')
+  if (has('go.mod')) tags.push('Go')
+  if (has('pyproject.toml') || has('requirements.txt') || has('setup.py')) tags.push('Python')
+  if (has('Package.swift') || names.some((f) => f.endsWith('.xcodeproj'))) tags.push('Swift')
+  if (!tags.length && names.some((f) => f.endsWith('.html'))) tags.push('HTML')
+  return tags.join(', ')
+}
+
+// Tokens and keys that should never reach a public branch by accident. Matches that are
+// clearly placeholders (ghp_xxxx..., AKIA...EXAMPLE) are ignored.
+const SECRETS = [
+  ['Anthropic key', 'sk-ant-[A-Za-z0-9_-]{20,}'],
+  ['OpenAI key', 'sk-(proj-)?[A-Za-z0-9_-]{40,}'],
+  ['GitHub token', 'gh[pousr]_[A-Za-z0-9]{36,}'],
+  ['GitHub token', 'github_pat_[A-Za-z0-9_]{40,}'],
+  ['AWS key', 'AKIA[0-9A-Z]{16}'],
+  ['Slack token', 'xox[abposr]-[A-Za-z0-9-]{10,}'],
+  ['Google API key', 'AIza[0-9A-Za-z_-]{35}'],
+  ['Private key', '-----BEGIN ([A-Z]+ )?PRIVATE KEY-----'],
+]
+const PLACEHOLDER = /(.)\1{5,}|example|dummy|placeholder|fake|your[_-]?/i
+
+function scanSecrets(tree) {
+  const r = run(['grep', '-I', '-n', '-o', '-E', ...SECRETS.flatMap(([, re]) => ['-e', re]), tree])
+  if (r.status !== 0) return []
+  const found = new Map()
+  for (const line of r.stdout.toString().split('\n').filter(Boolean)) {
+    const [, file, lineNo, ...rest] = line.split(':')
+    const match = rest.join(':')
+    if (PLACEHOLDER.test(match)) continue
+    const kind = SECRETS.find(([, re]) => new RegExp(re).test(match))[0]
+    found.set(`${file}:${lineNo}`, kind)
+  }
+  return [...found].map(([where, kind]) => `${where} (${kind})`)
+}
+
+// --- building a snapshot ---------------------------------------------------
+
+const size = (bytes) => (bytes === 0 ? '0 KB' : bytes < MB ? `${Math.max(1, Math.round(bytes / 1024))} KB` : `${(bytes / MB).toFixed(1)} MB`)
+const count = (n, noun) => `${n} ${noun}${n === 1 ? '' : 's'}`
+const day = (iso) => iso.slice(0, 10)
+
+function pointerReadme(slug, up, reason) {
+  return [
+    `# ${slug}`,
+    '',
+    `This branch keeps a pointer to [${slug}](${webUrl(slug)}) instead of a copy: ${reason}.`,
+    '',
+    `- Upstream: ${webUrl(slug)}`,
+    `- Commit: \`${up.sha}\``,
+    `- Tree: \`${up.tree}\``,
+    '',
+    'Get the project:',
+    '',
+    '```bash',
+    `git clone ${webUrl(slug)}.git`,
+    `git -C ${slug.split('/')[1]} checkout ${up.sha}`,
+    '```',
+    '',
+  ].join('\n')
+}
+
+// Decide copy, lean or pointer for one upstream commit, and write the tree for it.
+function snapshot(slug, up, manifest, { mode = 'copy', license: stated, allowSecrets }) {
+  const { project_mb: capMb, lean_file_mb: leanMb } = manifest.limits
+  const owned = manifest.owners.map((o) => o.toLowerCase()).includes(slug.split('/')[0].toLowerCase())
+  const license = stated ?? detectLicense(up.tree)
+  const files = blobs(up.tree)
+  const total = files.reduce((sum, f) => sum + f.size, 0)
+  const tooBig = (limit) => files.filter((f) => f.size > limit)
+  const base = { license: license ?? (owned ? 'owned' : 'none found'), bytes: total, files: files.length }
+
+  let reason = null
+  if (mode === 'pointer') reason = 'asked for a pointer'
+  else if (!owned && !license) reason = 'no open license was found, so copying it into a public repo is not allowed'
+  else if (mode === 'copy' && total > capMb * MB) reason = `${size(total)} is over the ${capMb} MB cap (--mode lean copies it without large files)`
+  else if (mode === 'copy' && tooBig(GITHUB_MAX).length) reason = `it has files over GitHub's 100 MB limit (--mode lean leaves them out)`
+
+  let tree = up.tree
+  let left = []
+  if (!reason && mode === 'lean') {
+    left = tooBig(leanMb * MB)
+    const kept = total - left.reduce((sum, f) => sum + f.size, 0)
+    if (kept > capMb * MB) reason = `${size(kept)} is over the ${capMb} MB cap even without files over ${leanMb} MB`
+    else if (left.length) {
+      const env = { ...ENV, GIT_INDEX_FILE: SCRATCH_INDEX }
+      fs.rmSync(SCRATCH_INDEX, { force: true })
+      git(['read-tree', up.tree], { env })
+      git(['update-index', '--force-remove', '-z', '--stdin'], { env, input: `${left.map((f) => f.path).join('\0')}\0` })
+      tree = git(['write-tree'], { env }).trim()
+      fs.rmSync(SCRATCH_INDEX, { force: true })
+    }
+  }
+
+  if (reason) {
+    const blob = git(['hash-object', '-w', '--stdin'], { input: pointerReadme(slug, up, reason) }).trim()
+    const tree = git(['mktree'], { input: `100644 blob ${blob}\tREADME.md\n` }).trim()
+    return { ...base, mode: 'pointer', reason, tree, description: describe(up.tree), stack: detectStack(up.tree) }
+  }
+  // GitHub runs a pushed branch's on: push workflows even off the default branch, with this repo's
+  // token. Copies keep theirs, so none goes up before Actions is off for the repo.
+  if (manifest.actions_off !== true && files.some((f) => f.path.startsWith('.github/workflows/'))) {
+    return { error: 'it has GitHub workflows, which would run here on push. Turn Actions off for this repo (Settings, Actions, General, "Disable actions"), then set "actions_off": true in library.json.' }
+  }
+  const secrets = scanSecrets(tree)
+  if (secrets.length && !allowSecrets) {
+    return { error: `possible secrets, so nothing was copied: ${secrets.slice(0, 5).join(', ')}${secrets.length > 5 ? ', ...' : ''}. Check them; --allow-secrets copies anyway.` }
+  }
+  return {
+    ...base,
+    mode: left.length ? 'lean' : 'copy',
+    tree,
+    left,
+    description: describe(up.tree),
+    stack: detectStack(up.tree),
+  }
+}
+
+function message(verb, slug, up, snap, extra = '') {
+  const what = {
+    copy: () => `Exact copy of ${slug} at ${up.sha}: ${count(snap.files, 'file')}, ${size(snap.bytes)}.`,
+    lean: () => `Copy of ${slug} at ${up.sha} without its large files:\n${snap.left.map((f) => `  ${f.path} (${size(f.size)})`).join('\n')}`,
+    pointer: () => `Pointer to ${slug} at ${up.sha}: ${snap.reason}.`,
+  }[snap.mode]()
+  return [
+    `${verb} ${slug} at ${up.sha.slice(0, 7)}`,
+    '',
+    what + extra,
+    '',
+    `Upstream: ${webUrl(slug)}`,
+    `Upstream-Commit: ${up.sha}`,
+    `Upstream-Tree: ${up.tree}`,
+    `Library-Mode: ${snap.mode}`,
+    `License: ${snap.license}`,
+    TOOL,
+    '',
+  ].join('\n')
+}
+
+const commit = (tree, parents, text, date) =>
+  git(['commit-tree', tree, ...parents.flatMap((p) => ['-p', p]), '-F', '-'], {
+    input: text,
+    env: date ? { ...ENV, GIT_AUTHOR_DATE: date } : ENV,
+  }).trim()
+
+function entryFor(old, up, snap, target, { description }) {
+  return {
+    description: description ?? old.description ?? snap.description ?? '',
+    stack: old.stack ?? snap.stack ?? '',
+    mode: snap.mode,
+    ...(snap.reason ? { reason: snap.reason } : {}),
+    license: snap.license,
+    ...(target.ref && target.want !== 'HEAD' ? { ref: target.ref } : {}),
+    ...(old.requested_mode || snap.requested ? { requested_mode: old.requested_mode ?? snap.requested } : {}),
+    upstream_commit: up.sha,
+    upstream_tree: up.tree,
+    tree: snap.tree,
+    snapshot: snap.commit,
+    bytes: snap.bytes,
+    files: snap.files,
+    updated: day(up.date),
+    added: old.added ?? new Date().toISOString().slice(0, 10),
+  }
+}
+
+// --- pushing ---------------------------------------------------------------
+
+// Every moved branch, plus main with the new index, go up in one atomic push. The leases
+// make sure nothing moved since we read it, so a run either fully lands or changes nothing.
+function pushAll(manifest, moves, remote, messageText) {
+  const files = ['README.md', 'library.json']
+  const before = files.map((f) => fs.readFileSync(path.join(ROOT, f), 'utf8'))
+  const head = git(['rev-parse', '-q', '--verify', 'HEAD'], { ok: true })?.trim()
+  manifest.projects = Object.fromEntries(Object.entries(manifest.projects).sort(([a], [b]) => a.localeCompare(b)))
+  fs.writeFileSync(MANIFEST, `${JSON.stringify(manifest, null, 2)}\n`)
+  writeReadme(renderIndex(manifest))
+  git(['add', '--', ...files])
+  if (git(['diff', '--cached', '--quiet', '--', ...files], { ok: true }) === null || !head) {
+    git(['commit', '-q', '-m', messageText, '--', ...files])
+  }
+  const leases = moves.map(({ branch }) => `--force-with-lease=refs/heads/${branch}:${remote.get(branch) ?? ''}`)
+  const refs = moves.map(({ branch, sha }) => `${sha ?? ''}:refs/heads/${branch}`)
+  const push = run(['-c', 'push.negotiate=false', 'push', '--atomic', '-q', ...leases, 'origin', ...refs, 'HEAD:refs/heads/main'])
+  if (push.status !== 0) {
+    // Put main back as it was, so the next run does not think these changes landed.
+    if (head) git(['reset', '-q', '--soft', head])
+    else git(['update-ref', '-d', 'HEAD'])
+    files.forEach((f, i) => fs.writeFileSync(path.join(ROOT, f), before[i]))
+    git(['reset', '-q', '--', ...files], { ok: true })
+    die(`Push failed, so nothing changed on origin or here:\n${push.stderr.toString().trim()}`)
+  }
+  for (const { branch, sha } of moves) {
+    if (sha) git(['update-ref', `refs/remotes/origin/${branch}`, sha])
+    else git(['update-ref', '-d', `refs/remotes/origin/${branch}`], { ok: true })
+  }
+  git(['update-ref', 'refs/remotes/origin/main', 'HEAD'])
+}
+
+function renderIndex(manifest) {
+  const repo = repoUrl()
+  const cell = (text) => String(text ?? '').replace(/\|/g, '\\|').replace(/\n/g, ' ')
+  const rows = Object.entries(manifest.projects).sort(([a, x], [b, y]) => (y.updated ?? '').localeCompare(x.updated ?? '') || a.localeCompare(b))
+  const total = rows.reduce((sum, [, e]) => sum + (e.mode === 'pointer' ? 0 : e.bytes ?? 0), 0)
+  const lines = [
+    `${count(rows.length, 'project')}, ${size(total)} of files copied, most recently changed upstream first.`,
+    '',
+    '| Project | What it is | Kept as | License | Size | Upstream commit | Updated |',
+    '| --- | --- | --- | --- | --- | --- | --- |',
+    ...rows.map(([slug, e]) => {
+      const kept = e.mode === 'pointer' ? 'pointer' : e.mode === 'lean' ? 'copy without large files' : 'exact copy'
+      const commitLink = `[\`${e.upstream_commit.slice(0, 7)}\`](${webUrl(slug)}/commit/${e.upstream_commit})`
+      return `| [${slug}](${repo}/tree/${slug}) | ${cell(e.description)} | ${kept} | ${cell(e.license)} | ${e.mode === 'pointer' ? '' : size(e.bytes)} | ${commitLink} | ${e.updated} |`
+    }),
+  ]
+  const retired = Object.entries(manifest.retired).reverse()
+  if (retired.length) {
+    lines.push(
+      '',
+      '### Retired',
+      '',
+      `Each retired project is one commit on the [\`${ATTIC}\`](${repo}/commits/${ATTIC}) branch, newest first.`,
+      '',
+      '| Project | What it was | Retired |',
+      '| --- | --- | --- |',
+      ...retired.map(([slug, e]) => `| [${slug}](${repo}/tree/${e.attic_commit}) | ${cell(e.description)} | ${e.retired} |`),
+    )
+  }
+  return lines.join('\n')
+}
+
+function writeReadme(index) {
+  const text = fs.readFileSync(README, 'utf8')
+  const start = text.indexOf(START)
+  const end = text.indexOf(END)
+  if (start < 0 || end < start) die(`README.md needs ${START} and ${END} around the index.`)
+  fs.writeFileSync(README, `${text.slice(0, start + START.length)}\n${index}\n${text.slice(end)}`)
+}
+
+// --- commands --------------------------------------------------------------
+
+const say = (slug, status, note = '') => console.log(`  ${slug.padEnd(36)} ${status.padEnd(14)} ${note}`)
+
+function add(slugs, flags, manifest, remote) {
+  if (flags.mode && !['copy', 'lean', 'pointer'].includes(flags.mode)) die('--mode is copy, lean or pointer.')
+  const moves = []
+  for (const slug of slugs) {
+    if (manifest.projects[slug]) die(`${slug} is already in the library. Use ./library update ${slug}.`)
+    if (manifest.retired[slug]) die(`${slug} is retired. Remove it from "retired" in library.json to add it again.`)
+    if (remote.has(slug)) die(`A ${slug} branch already exists on origin but is not in library.json. Remove or adopt it by hand first.`)
+    const target = resolve(slug, flags.ref)
+    if (target.error) die(`${slug}: ${target.error}.`)
+    const up = fetchUpstream(target)
+    if (up.error) die(`${slug}: ${up.error}.`)
+    const snap = snapshot(slug, up, manifest, { mode: flags.mode, license: flags.license, allowSecrets: flags['allow-secrets'] })
+    if (snap.error) die(`${slug}: ${snap.error}`)
+    snap.requested = flags.mode && flags.mode !== 'copy' ? flags.mode : undefined
+    snap.commit = commit(snap.tree, [], message('Add', slug, up, snap), up.date)
+    say(slug, flags['dry-run'] ? `would add` : 'added', `${snap.mode}${snap.reason ? `: ${snap.reason}` : `, ${count(snap.files, 'file')}, ${size(snap.bytes)}`}`)
+    manifest.projects[slug] = entryFor({}, up, snap, target, flags)
+    moves.push({ branch: slug, sha: snap.commit })
+  }
+  return moves
+}
+
+// A branch is "patched" when its tip is not the tree the tool last wrote for upstream.
+// Then the new upstream snapshot becomes a child of the previous snapshot, and the
+// branch gets a merge of it, so your commits stay on top.
+function update(slugs, flags, manifest, remote) {
+  const names = slugs.length ? slugs : Object.keys(manifest.projects)
+  const moves = []
+  for (const slug of names) {
+    const old = manifest.projects[slug]
+    if (!old) die(`${slug} is not in the library. Use ./library add ${slug}.`)
+    const tip = remote.get(slug)
+    if (!tip) {
+      say(slug, 'missing', 'no branch on origin; ./library check explains')
+      continue
+    }
+    const target = resolve(slug, old.ref)
+    if (target.error) {
+      say(slug, 'unreachable', target.error)
+      continue
+    }
+    if (target.sha === old.upstream_commit) {
+      say(slug, 'unchanged')
+      continue
+    }
+    const up = fetchUpstream(target)
+    if (up.error) {
+      say(slug, 'fetch failed', up.error)
+      continue
+    }
+    const snap = snapshot(slug, up, manifest, { mode: old.requested_mode, license: flags.license, allowSecrets: flags['allow-secrets'] })
+    if (snap.error) {
+      say(slug, 'refused', snap.error)
+      continue
+    }
+    have(tip)
+    have(old.snapshot)
+    const tipTree = git(['rev-parse', `${tip}^{tree}`]).trim()
+    const patched = tipTree !== old.tree
+    snap.commit = commit(snap.tree, [old.snapshot], message('Update', slug, up, snap), up.date)
+    let head = snap.commit
+    if (patched) {
+      const merged = run(['merge-tree', '--write-tree', '--name-only', `--merge-base=${old.snapshot}`, tip, snap.commit])
+      if (merged.status !== 0) {
+        const out = merged.stdout.toString().split('\n')
+        const conflicts = out.slice(1, out.indexOf('')).filter(Boolean)
+        say(slug, 'conflict', conflicts.length ? `your changes clash with upstream in ${conflicts.join(', ')}` : lastLine(merged.stderr))
+        continue
+      }
+      const tree = merged.stdout.toString().split('\n')[0].trim()
+      head = commit(tree, [tip, snap.commit], `Merge ${slug} ${up.sha.slice(0, 7)} into your changes\n\n${TOOL}\n`)
+    }
+    say(slug, flags['dry-run'] ? 'would update' : 'updated', `${old.upstream_commit.slice(0, 7)} -> ${up.sha.slice(0, 7)}, ${snap.mode}${patched ? ', merged with your changes' : ''}`)
+    manifest.projects[slug] = entryFor(old, up, snap, target, flags)
+    moves.push({ branch: slug, sha: head })
+  }
+  return moves
+}
+
+function retire(slugs, flags, manifest, remote) {
+  if (!slugs.length) die('Name the projects to retire, for example: ./library retire owner/repo')
+  let tip = remote.get(ATTIC) ?? null
+  if (tip) have(tip)
+  const moves = []
+  const today = new Date().toISOString().slice(0, 10)
+  for (const slug of slugs) {
+    const entry = manifest.projects[slug]
+    const head = remote.get(slug)
+    if (!entry || !head) die(`${slug} is not a live project here.`)
+    have(head)
+    const text = `Retire ${slug}\n\n${entry.description ? `${entry.description}\n\n` : ''}The ${slug} branch at ${head.slice(0, 7)} (upstream ${entry.upstream_commit.slice(0, 7)}), squashed to one commit. The branch was deleted.\n`
+    tip = commit(git(['rev-parse', `${head}^{tree}`]).trim(), tip ? [tip] : [], text)
+    say(slug, flags['dry-run'] ? 'would retire' : 'retired', `onto ${ATTIC}`)
+    delete manifest.projects[slug]
+    delete manifest.retired[slug]
+    manifest.retired[slug] = { ...entry, retired: today, attic_commit: tip }
+    moves.push({ branch: slug, sha: null })
+  }
+  moves.push({ branch: ATTIC, sha: tip })
+  return moves
+}
+
+// Every branch matches the index, copies are byte-identical to upstream, and (with
+// --upstream) the recorded upstream tree is what GitHub serves for that commit.
+function check(flags, manifest, remote) {
+  let bad = 0
+  for (const [slug, e] of Object.entries(manifest.projects)) {
+    const problems = []
+    const tip = remote.get(slug)
+    if (!tip) problems.push('no branch on origin')
+    else {
+      have(tip)
+      have(e.snapshot)
+      const body = git(['log', '-1', '--format=%B', e.snapshot])
+      const trailer = (key) => body.match(new RegExp(`^${key}: (.+)$`, 'm'))?.[1]
+      if (!body.includes(TOOL)) problems.push('the recorded snapshot is not a library commit')
+      if (git(['rev-parse', `${e.snapshot}^{tree}`]).trim() !== e.tree) problems.push('the snapshot tree differs from library.json')
+      if (trailer('Upstream-Tree') !== e.upstream_tree || trailer('Upstream-Commit') !== e.upstream_commit) problems.push('the snapshot trailers differ from library.json')
+      if (e.mode === 'copy' && e.tree !== e.upstream_tree) problems.push('an exact copy whose tree is not the upstream tree')
+      if (tip !== e.snapshot && git(['merge-base', '--is-ancestor', e.snapshot, tip], { ok: true }) === null) {
+        // A shallow fetch can't always answer; fetch a little history and ask again.
+        run(['fetch', '-q', '--deepen', '50', 'origin', `refs/heads/${slug}`])
+        if (git(['merge-base', '--is-ancestor', e.snapshot, tip], { ok: true }) === null) problems.push('the snapshot is not in the branch history')
+      }
+      if (flags.upstream && e.mode !== 'pointer') {
+        const fetched = anon(['fetch', '-q', '--depth', '1', '--no-tags', upstreamUrl(slug), e.upstream_commit])
+        if (fetched.status !== 0) problems.push(`cannot fetch ${e.upstream_commit.slice(0, 7)} from upstream: ${lastLine(fetched.stderr)}`)
+        else if (git(['rev-parse', `${e.upstream_commit}^{tree}`]).trim() !== e.upstream_tree) problems.push('upstream serves a different tree for that commit')
+      }
+    }
+    bad += problems.length
+    if (problems.length) say(slug, 'PROBLEM', problems.join('; '))
+    else say(slug, 'ok', git(['rev-parse', `${tip}^{tree}`]).trim() === e.tree ? e.mode : `${e.mode}, with your changes on top`)
+  }
+  for (const branch of remote.keys()) {
+    if (!RESERVED.has(branch) && !manifest.projects[branch]) {
+      bad++
+      say(branch, 'PROBLEM', 'a branch on origin that library.json does not list')
+    }
+  }
+  console.log(bad ? `\n${count(bad, 'problem')}.` : `\nAll ${count(Object.keys(manifest.projects).length, 'project')} check out.`)
+  if (bad) process.exitCode = 1
+}
+
+function get(args, manifest) {
+  const [arg, dir] = args
+  if (!arg) die('Usage: ./library get owner/repo [dir]')
+  const slug = slugArg(arg)
+  const e = manifest.projects[slug]
+  if (!e) die(`${slug} is not in the library.${manifest.retired[slug] ? ` It is retired: ${repoUrl()}/tree/${manifest.retired[slug].attic_commit}` : ''}`)
+  const dest = dir ?? slug.split('/')[1]
+  const args2 = ['clone', '--single-branch', '--depth', '1', '-b', slug, originUrl(), dest]
+  console.log(`git ${args2.join(' ')}`)
+  const r = spawnSync('git', args2, { stdio: 'inherit', env: ENV })
+  if (r.status !== 0) process.exitCode = 1
+}
+
+function main() {
+  const [command, ...rest] = process.argv.slice(2)
+  const { flags, args } = parseArgs(rest)
+  if (!command || flags.help || command === 'help') {
+    return console.log(fs.readFileSync(__filename, 'utf8').split('\n').slice(1, 15).map((l) => l.replace(/^\/\/ ?/, '')).join('\n'))
+  }
+  if (!isRepo(ROOT)) die('Run ./library from a checkout of the library repo.')
+  const manifest = loadManifest()
+  if (command === 'get') return get(args, manifest)
+
+  lock()
+  const remote = remoteBranches()
+  if (command === 'check') return check(flags, manifest, remote)
+  if (!flags['dry-run']) syncMain(remote)
+  // Read the manifest again once main has caught up, or this run writes over index changes made elsewhere.
+  const fresh = loadManifest()
+  const slugs = args.map(slugArg)
+
+  const commands = { add, update, retire, index: () => [] }
+  if (!commands[command]) die(`Unknown command "${command}". Run ./library help.`)
+  if (command === 'add' && !slugs.length) die('Usage: ./library add owner/repo [--ref <branch|tag|sha>] [--mode copy|lean|pointer]')
+  const moves = commands[command](slugs, flags, fresh, remote)
+  if (flags['dry-run']) return console.log('\nDry run: nothing was written or pushed.')
+  if (command !== 'index' && !moves.length) return console.log('\nNothing to push.')
+  const label = { add: 'Add', update: 'Update', retire: 'Retire', index: 'Rewrite the index' }[command]
+  pushAll(fresh, moves, remote, command === 'index' ? label : `${label} ${moves.filter((m) => m.branch !== ATTIC).map((m) => m.branch).join(', ')}`)
+  console.log(`\nPushed ${moves.length} branch${moves.length === 1 ? '' : 'es'} and the index.`)
+}
+
+module.exports = { parseArgs, slugArg, detectLicense, scanSecrets, LICENSES, NOT_OPEN, PLACEHOLDER }
+
+if (require.main === module) main()

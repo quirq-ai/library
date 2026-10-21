@@ -1,0 +1,10 @@
+# quirq infra (qq) manifest for library, schema quirq-repo/1 (quirq-ai/sync). Read and edit it only
+# through qqsync. Manifest only, like experiments: main is the ./library tool and the index, and
+# the projects live on owner/repo branches that qq never builds. Not onboarded: infra-config
+# repos.toml does not list library.
+schema = "quirq-repo/1"
+
+[[targets]]
+name = "library"
+kind = "static-docs"
+srcs = ["library", "library.json", "README.md", "AGENTS.md", "CLAUDE.md", "test/**", "package.json", "LICENSE"]
