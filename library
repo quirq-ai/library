@@ -16,6 +16,7 @@
 
 const { spawnSync } = require('node:child_process')
 const fs = require('node:fs')
+const os = require('node:os')
 const path = require('node:path')
 
 const ROOT = __dirname
@@ -43,6 +44,13 @@ for (const key of ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE']) delete ENV[key
 function run(args, { cwd = ROOT, env = ENV, input } = {}) {
   return spawnSync('git', args, { cwd, env, input, maxBuffer: 1 << 30 })
 }
+
+// Upstream is read the way a stranger reads it: no stored login, netrc, ssh key, token header or
+// prompt reaches it. So only public repos can be copied into this public one, owners' repos included.
+const ANON_ENV = { ...ENV, HOME: path.join(GIT_DIR, 'library-anon'), GIT_CONFIG_GLOBAL: os.devNull, GIT_TERMINAL_PROMPT: '0', GIT_SSH_COMMAND: 'false' }
+for (const key of ['GIT_ASKPASS', 'SSH_ASKPASS', 'XDG_CONFIG_HOME']) delete ANON_ENV[key]
+const ANON = ['-c', 'credential.helper=', '-c', 'core.askPass=', '-c', 'http.extraHeader=', '-c', `http.${UPSTREAM}/.extraHeader=`]
+const anon = (args) => run([...ANON, ...args], { env: ANON_ENV })
 
 function git(args, { ok = false, ...options } = {}) {
   const r = run(args, options)
@@ -152,12 +160,20 @@ function remoteBranches() {
   return branches
 }
 
-// main has to fast-forward to origin before the index changes, or pushing it fails.
+// main has to fast-forward to origin before the index changes, or pushing it fails. A run pushes
+// HEAD to main, so it runs only on main and only when main holds nothing origin lacks: the push then
+// adds the index commit and nothing that skipped review.
 function syncMain(remote) {
+  if (git(['symbolic-ref', '-q', '--short', 'HEAD'], { ok: true })?.trim() !== 'main') {
+    die('Run ./library from main (git switch main): it pushes this checkout to main.')
+  }
   if (!remote.has('main')) return
   git(['fetch', '-q', 'origin', 'main'])
   if (git(['merge', '-q', '--ff-only', 'origin/main'], { ok: true }) === null) {
     die('Local main has diverged from origin/main. Reconcile them, then run this again.')
+  }
+  if (git(['rev-list', '--count', 'origin/main..HEAD']).trim() !== '0') {
+    die('Local main has commits that are not on origin/main. Land them through a pull request first, then run this again.')
   }
 }
 
@@ -185,10 +201,11 @@ const webUrl = (slug) => `https://github.com/${slug}`
 function resolve(slug, ref) {
   const url = upstreamUrl(slug)
   if (ref && SHA.test(ref)) return { url, want: ref, sha: ref, ref }
-  const out = ref
-    ? git(['ls-remote', url, `refs/heads/${ref}`, `refs/tags/${ref}`, `refs/tags/${ref}^{}`], { ok: true })
-    : git(['ls-remote', '--symref', url, 'HEAD'], { ok: true })
-  if (out === null) return { error: `cannot read ${webUrl(slug)}: it is private, renamed or gone` }
+  const listed = ref
+    ? anon(['ls-remote', url, `refs/heads/${ref}`, `refs/tags/${ref}`, `refs/tags/${ref}^{}`])
+    : anon(['ls-remote', '--symref', url, 'HEAD'])
+  const out = listed.status === 0 ? listed.stdout.toString() : null
+  if (out === null) return { error: `cannot read ${webUrl(slug)} without logging in: it is private, renamed or gone, and only public repos are copied` }
   const lines = out.split('\n').filter(Boolean)
   const find = (name) => lines.find((l) => !l.startsWith('ref: ') && l.endsWith(`\t${name}`))?.split('\t')[0]
   if (!ref) {
@@ -203,7 +220,7 @@ function resolve(slug, ref) {
 
 // One shallow fetch of the upstream commit into this repo's own objects.
 function fetchUpstream(target) {
-  const fetched = run(['fetch', '-q', '--depth', '1', '--no-tags', target.url, target.want])
+  const fetched = anon(['fetch', '-q', '--depth', '1', '--no-tags', target.url, target.want])
   if (fetched.status !== 0) return { error: `fetching ${target.url} failed: ${lastLine(fetched.stderr)}` }
   const sha = git(['rev-parse', 'FETCH_HEAD^{commit}']).trim()
   return {
@@ -249,10 +266,18 @@ const LICENSES = [
   ['Zlib', /This software is provided 'as-is', without any express or implied/],
 ]
 
+// Source-available and open-core terms often quote an open license: Sentry's FSL names Apache 2.0,
+// PostHog's MIT file carves out ee/ for a license that forbids publishing it. Any of these in any
+// license file of the project means it is not open, whatever else the file says.
+const NOT_OPEN = /Functional Source License|Business Source License|Server Side Public License|Commons Clause|Elastic License|Sustainable Use License|PolyForm|Source[- ]Available|Enterprise License|Portions of this software are licensed/i
+const LICENSE_FILE = /^(licen[cs]e|copying)([.-][\w.-]+)?$/i
+
 function detectLicense(tree) {
-  const file = rootNames(tree).find((f) => /^(licen[cs]e|copying)([.-][\w.-]+)?$/i.test(f))
+  const file = rootNames(tree).find((f) => LICENSE_FILE.test(f))
   const text = file ? readBlob(tree, file) : null
-  if (!text) return null
+  if (!text || NOT_OPEN.test(text)) return null
+  const nested = blobs(tree).filter((f) => f.type === 'blob' && f.path.includes('/') && LICENSE_FILE.test(path.posix.basename(f.path)))
+  if (nested.some((f) => NOT_OPEN.test(readBlob(tree, f.path) ?? ''))) return null
   return LICENSES.find(([, re]) => re.test(text))?.[0] ?? null
 }
 
@@ -380,6 +405,11 @@ function snapshot(slug, up, manifest, { mode = 'copy', license: stated, allowSec
     const blob = git(['hash-object', '-w', '--stdin'], { input: pointerReadme(slug, up, reason) }).trim()
     const tree = git(['mktree'], { input: `100644 blob ${blob}\tREADME.md\n` }).trim()
     return { ...base, mode: 'pointer', reason, tree, description: describe(up.tree), stack: detectStack(up.tree) }
+  }
+  // GitHub runs a pushed branch's on: push workflows even off the default branch, with this repo's
+  // token. Copies keep theirs, so none goes up before Actions is off for the repo.
+  if (manifest.actions_off !== true && files.some((f) => f.path.startsWith('.github/workflows/'))) {
+    return { error: 'it has GitHub workflows, which would run here on push. Turn Actions off for this repo (Settings, Actions, General, "Disable actions"), then set "actions_off": true in library.json.' }
   }
   const secrets = scanSecrets(tree)
   if (secrets.length && !allowSecrets) {
@@ -644,7 +674,7 @@ function check(flags, manifest, remote) {
         if (git(['merge-base', '--is-ancestor', e.snapshot, tip], { ok: true }) === null) problems.push('the snapshot is not in the branch history')
       }
       if (flags.upstream && e.mode !== 'pointer') {
-        const fetched = run(['fetch', '-q', '--depth', '1', '--no-tags', upstreamUrl(slug), e.upstream_commit])
+        const fetched = anon(['fetch', '-q', '--depth', '1', '--no-tags', upstreamUrl(slug), e.upstream_commit])
         if (fetched.status !== 0) problems.push(`cannot fetch ${e.upstream_commit.slice(0, 7)} from upstream: ${lastLine(fetched.stderr)}`)
         else if (git(['rev-parse', `${e.upstream_commit}^{tree}`]).trim() !== e.upstream_tree) problems.push('upstream serves a different tree for that commit')
       }
@@ -705,6 +735,6 @@ function main() {
   console.log(`\nPushed ${moves.length} branch${moves.length === 1 ? '' : 'es'} and the index.`)
 }
 
-module.exports = { parseArgs, slugArg, detectLicense, scanSecrets, LICENSES, PLACEHOLDER }
+module.exports = { parseArgs, slugArg, detectLicense, scanSecrets, LICENSES, NOT_OPEN, PLACEHOLDER }
 
 if (require.main === module) main()

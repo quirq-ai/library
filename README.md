@@ -45,7 +45,13 @@ Every command that writes takes `--dry-run`. Descriptions come from the project'
 
 ## Repo settings
 
-Turn GitHub Actions off for this repo (Settings, Actions, General, "Disable actions"), so workflows copied with a project can never run here. Copies keep their `.github/workflows` because removing them would break the exact-copy rule. Dependabot and code scanning stay off for the same reason.
+Turn GitHub Actions off for this repo (Settings, Actions, General, "Disable actions"), so workflows copied with a project can never run here. Copies keep their `.github/workflows` because removing them would break the exact-copy rule, and GitHub runs a pushed branch's `on: push` workflows even when the branch is not the default one. Until `"actions_off": true` is set in [`library.json`](library.json), the tool refuses to copy a project that has workflows. Dependabot and code scanning stay off for the same reason.
+
+The tool reads upstream without your GitHub login, so a private repo is never copied, even one under `owners`.
+
+## License
+
+The Apache-2.0 [LICENSE](LICENSE) covers the tool and the index on `main`. Each project branch keeps its upstream's own license files and terms; nothing here relicenses them.
 
 ## Index
 

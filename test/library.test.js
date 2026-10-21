@@ -236,3 +236,50 @@ test('a failed push leaves origin and the checkout as they were', () => {
   assert.deepEqual(manifest().projects, {})
   assert.equal(git(['status', '--porcelain']), '')
 })
+
+test('upstream is read without the caller\'s git config or logins', () => {
+  upstream('hidden/thing', { LICENSE: MIT, 'a.txt': 'private\n' })
+  const config = path.join(tmp, 'gitconfig')
+  // Stands in for a stored login: the caller's own config can reach a repo a stranger cannot.
+  fs.writeFileSync(config, `[url "file://${base}/hidden/"]\n\tinsteadOf = file://${base}/sharmasuraj0123/\n`)
+  const r = sh(path.join(lib, 'library'), ['add', 'sharmasuraj0123/thing'], lib, { GIT_CONFIG_GLOBAL: config })
+  assert.equal(r.status, 1, r.out)
+  assert.match(r.out, /without logging in/)
+  assert.doesNotMatch(git(['ls-remote', '--heads', 'origin']), /thing/)
+})
+
+test('runs only from main with nothing unpushed', () => {
+  upstream('acme/tool', { LICENSE: MIT, 'a.txt': '1\n' })
+  const main = git(['rev-parse', 'HEAD'])
+  git(['switch', '-q', '-c', 'feature'])
+  fs.appendFileSync(path.join(lib, 'README.md'), 'unreviewed\n')
+  git(['commit', '-q', '-am', 'unreviewed'])
+  assert.match(library('add', 'acme/tool').out, /from main/)
+  git(['switch', '-q', 'main'])
+  git(['merge', '-q', '--ff-only', 'feature'])
+  assert.match(library('add', 'acme/tool').out, /not on origin\/main/)
+  assert.equal(git(['ls-remote', 'origin', 'refs/heads/main']).split('\t')[0], main)
+})
+
+test('source-available and open-core licenses are not open', () => {
+  upstream('acme/fsl', { 'LICENSE.md': '# Functional Source License, Version 1.1, Apache 2.0 Future License\n\nLicensed under the Apache License, Version 2.0\n', 'a.txt': 'a\n' })
+  assert.equal(library('add', 'acme/fsl').status, 0)
+  assert.equal(manifest().projects['acme/fsl'].mode, 'pointer')
+  upstream('acme/core', { LICENSE: MIT, 'ee/LICENSE': 'The Acme Enterprise License\n', 'a.txt': 'a\n' })
+  assert.equal(library('add', 'acme/core').status, 0)
+  assert.equal(manifest().projects['acme/core'].mode, 'pointer')
+})
+
+test('a project with workflows waits until Actions is off', () => {
+  upstream('acme/ci', { LICENSE: MIT, '.github/workflows/ci.yml': 'on: push\n' })
+  const r = library('add', 'acme/ci')
+  assert.equal(r.status, 1)
+  assert.match(r.out, /Disable actions/)
+  const m = manifest()
+  m.actions_off = true
+  fs.writeFileSync(path.join(lib, 'library.json'), `${JSON.stringify(m, null, 2)}\n`)
+  git(['commit', '-q', '-am', 'Actions are off'])
+  git(['push', '-q', 'origin', 'main'])
+  assert.equal(library('add', 'acme/ci').status, 0)
+  assert.equal(manifest().projects['acme/ci'].mode, 'copy')
+})
