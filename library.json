@@ -1,0 +1,12 @@
+{
+  "owners": [
+    "quirq-ai",
+    "sharmasuraj0123"
+  ],
+  "limits": {
+    "project_mb": 50,
+    "lean_file_mb": 10
+  },
+  "projects": {},
+  "retired": {}
+}
